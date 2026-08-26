@@ -2,11 +2,21 @@ name: Price Alert
 
 on:
   workflow_dispatch:
+  # OPTIONAL but recommended: GitHub kills every job after 6h, so without
+  # auto-restarts the monitor just stops. These crons restart it every 6h;
+  # the 03:45 UTC run lands shortly BEFORE midnight New York time, so the
+  # state resets cleanly at the day boundary.
+  schedule:
+    - cron: "45 3-21/6 * * *"   # 03:45 / 09:45 / 15:45 / 21:45 UTC
+
+# Prevent two monitors running at the same time (double alerts)
+concurrency:
+  group: price-monitor
+  cancel-in-progress: true
 
 jobs:
   price-monitor:
     runs-on: ubuntu-latest
-
     timeout-minutes: 360
 
     steps:
