@@ -4,6 +4,7 @@ import signal
 import requests
 from datetime import datetime, time as dtime, timezone
 from zoneinfo import ZoneInfo
+from datetime import datetime, time as dtime, timedelta, timezone
 
 # ============================================================================
 # CONFIG
@@ -26,6 +27,9 @@ UTC = timezone.utc
 
 BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
+
+IRAN = ZoneInfo("Asia/Tehran")   # Iran = UTC+3:30 all year (no DST since 2022)
+SEND_RUN_REMINDER = True         # send the "run workflow tomorrow" reminder
 
 # ============================================================================
 # STATE
@@ -345,6 +349,28 @@ def deliver_srfvg(sig, already=False):
     except Exception as e:
         print(f"Alert delivery FAILED: {e}", flush=True)
     return False
+def send_run_reminder():
+    """After the day's SRFVG alert: remind to run the workflow tomorrow at
+    01:00 New York time (= 08:30 Iran in summer, 09:30 in winter — computed)."""
+    global reminder_day
+    if not SEND_RUN_REMINDER:
+        return
+    today = midnight_est_ms(int(time.time() * 1000))
+    if reminder_day == today:                     # max one reminder per ET day
+        return
+    reminder_day = today
+
+    # tomorrow at MONITOR_START_HOUR (01:00) New York wall-clock time
+    run_at_ny = (datetime.now(NY) + timedelta(days=1)).replace(
+        hour=MONITOR_START_HOUR, minute=0, second=0, microsecond=0)
+    run_at_iran = run_at_ny.astimezone(IRAN)
+    tz_label = "EST" if run_at_ny.utcoffset() == timedelta(hours=-5) else "EDT"
+
+    send_telegram(
+        f"⏰ Reminder: don't forget to run the workflow tomorrow at "
+        f"{run_at_iran:%H:%M} Iran time "
+        f"({run_at_ny:%H:%M} {tz_label} New York)."
+    )
 
 def on_srfvg(sig, already=False):
     global marked_day, last_srfvg
@@ -354,6 +380,11 @@ def on_srfvg(sig, already=False):
     print(f"SRFVG ({sig['direction']}) "
           f"{est_hm(sig['fvg_from'])}-{est_hm(sig['fvg_to'])} ET "
           f"{'sent' if ok else 'FAILED'}.", flush=True)
+    if ok:
+        try:
+            send_run_reminder()
+        except Exception as e:
+            print(f"Reminder failed (non-fatal): {e}", flush=True)
 
 # ============================================================================
 # STARTUP SCAN (first successful poll) + LIVE LOOP
