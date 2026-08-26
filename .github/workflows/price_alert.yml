@@ -2,17 +2,18 @@ name: Price Alert
 
 on:
   workflow_dispatch:
-  # OPTIONAL but recommended: GitHub kills every job after 6h, so without
-  # auto-restarts the monitor just stops. These crons restart it every 6h;
-  # the 03:45 UTC run lands shortly BEFORE midnight New York time, so the
-  # state resets cleanly at the day boundary.
+  # Restart every 6h (GitHub's job limit). 03:50 UTC = 23:50 EDT / 22:50 EST,
+  # always just BEFORE midnight New York -> clean day reset; the handover
+  # candle it may lose is pre-midnight and therefore irrelevant.
   schedule:
-    - cron: "45 3-21/6 * * *"   # 03:45 / 09:45 / 15:45 / 21:45 UTC
+    - cron: "50 3-21/6 * * *"    # 03:50 / 09:50 / 15:50 / 21:50 UTC
 
-# Prevent two monitors running at the same time (double alerts)
 concurrency:
   group: price-monitor
   cancel-in-progress: true
+
+permissions:
+  contents: write               # lets the script commit state.json
 
 jobs:
   price-monitor:
@@ -27,14 +28,14 @@ jobs:
         uses: actions/setup-python@v6
         with:
           python-version: "3.12"
+          cache: "pip"           # cached wheels -> fast startup
 
       - name: Install dependencies
-        run: |
-          pip install requests
+        run: pip install --quiet --no-input -r requirements.txt
 
-      - name: Run price monitor
+      - name: Run SRFVG monitor
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: |
-          python price_alert.py
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python price_alert.py
