@@ -2,9 +2,6 @@ name: Price Alert
 
 on:
   workflow_dispatch:
-  # Restart every 6h (GitHub's job limit). 03:50 UTC = 23:50 EDT / 22:50 EST,
-  # always just BEFORE midnight New York -> clean day reset; the handover
-  # candle it may lose is pre-midnight and therefore irrelevant.
   schedule:
     - cron: "50 3-21/6 * * *"    # 03:50 / 09:50 / 15:50 / 21:50 UTC
 
@@ -13,7 +10,7 @@ concurrency:
   cancel-in-progress: true
 
 permissions:
-  contents: write               # lets the script commit state.json
+  contents: write
 
 jobs:
   price-monitor:
@@ -28,10 +25,9 @@ jobs:
         uses: actions/setup-python@v6
         with:
           python-version: "3.12"
-          cache: "pip"           # cached wheels -> fast startup
 
       - name: Install dependencies
-        run: pip install --quiet --no-input -r requirements.txt
+        run: pip install --quiet requests matplotlib
 
       - name: Run SRFVG monitor
         env:
