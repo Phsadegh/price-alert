@@ -3,19 +3,16 @@ name: Price Alert
 on:
   workflow_dispatch:
   schedule:
-    - cron: "50 3-21/6 * * *"    # 03:50 / 09:50 / 15:50 / 21:50 UTC
+    - cron: "50 3-21/6 * * *"    # 03:50 / 09:50 / 15:50 / 21:50 UTC (6h restart)
 
 concurrency:
   group: price-monitor
   cancel-in-progress: true
 
-permissions:
-  contents: write
-
 jobs:
   price-monitor:
     runs-on: ubuntu-latest
-    timeout-minutes: 360
+    timeout-minutes: 355
 
     steps:
       - name: Checkout repository
@@ -33,5 +30,4 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: python price_alert.py
