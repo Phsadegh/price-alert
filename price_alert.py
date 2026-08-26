@@ -4,6 +4,10 @@ import requests
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
+# =========================
+# CONFIG
+# =========================
+
 SYMBOL = "USTEC"
 BASE_URL = "https://biquote.io/api"
 
@@ -16,9 +20,11 @@ BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 
 
-def send_telegram(message):
-    print("Sending Telegram message...", flush=True)
+# =========================
+# TELEGRAM
+# =========================
 
+def send_telegram(message):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
 
     response = requests.post(
@@ -30,65 +36,37 @@ def send_telegram(message):
         timeout=20,
     )
 
-    print(f"Telegram HTTP status: {response.status_code}", flush=True)
-
     response.raise_for_status()
 
 
+# =========================
+# BIQUOTE
+# =========================
+
 def get_price():
 
-    url = f"{BASE_URL}/quote"
+    url = f"{BASE_URL}/{SYMBOL}"
 
-    params = {
-        "symbol": SYMBOL
-    }
+    response = requests.get(
+        url,
+        timeout=10
+    )
 
-    print(f"Requesting Biquote: {url}", flush=True)
-    print(f"Parameters: {params}", flush=True)
+    response.raise_for_status()
 
-    try:
+    data = response.json()
 
-        response = requests.get(
-            url,
-            params=params,
-            timeout=10
-        )
+    print("Biquote:", data, flush=True)
 
-        print(
-            f"Biquote HTTP status: {response.status_code}",
-            flush=True
-        )
+    # Biquote uses "mid" for CFD/index prices
+    price = data["mid"]
 
-        print(
-            f"Biquote URL: {response.url}",
-            flush=True
-        )
+    return float(price)
 
-        print(
-            f"Biquote raw response: {response.text[:2000]}",
-            flush=True
-        )
 
-        response.raise_for_status()
-
-        data = response.json()
-
-        print(
-            f"Biquote JSON: {data}",
-            flush=True
-        )
-
-        return data
-
-    except Exception as e:
-
-        print(
-            f"BIQUOTE ERROR: {type(e).__name__}: {e}",
-            flush=True
-        )
-
-        return None
-
+# =========================
+# MAIN
+# =========================
 
 print("====================================", flush=True)
 print("USTEC PRICE MONITOR STARTING", flush=True)
@@ -96,42 +74,49 @@ print("====================================", flush=True)
 
 send_telegram(
     "🟢 USTEC monitor STARTED\n"
-    "Testing Biquote connection."
+    "Biquote price feed connected.\n"
+    "Checking every 30 seconds.\n"
+    "Telegram update every 1 minute."
 )
 
 last_sent = 0
 
 while True:
 
-    print(
-        f"\nChecking price at "
-        f"{datetime.now(NY).strftime('%Y-%m-%d %H:%M:%S ET')}",
-        flush=True
-    )
+    try:
 
-    data = get_price()
-
-    if data is not None:
+        price = get_price()
 
         now = datetime.now(NY)
 
-        # For now, send the COMPLETE API response
-        # so we can see Biquote's actual structure.
-
-        message = (
-            f"📊 USTEC API TEST\n\n"
-            f"Time: {now.strftime('%Y-%m-%d %H:%M:%S ET')}\n\n"
-            f"{str(data)[:3000]}"
+        print(
+            f"{now.strftime('%Y-%m-%d %H:%M:%S ET')} "
+            f"USTEC = {price}",
+            flush=True
         )
 
-        try:
-            send_telegram(message)
-            last_sent = time.time()
+        current_time = time.time()
 
-        except Exception as e:
-            print(
-                f"Telegram ERROR: {e}",
-                flush=True
+        if current_time - last_sent >= SEND_INTERVAL:
+
+            message = (
+                f"📊 USTEC\n\n"
+                f"Price: {price:.2f}\n"
+                f"Time: {now.strftime('%Y-%m-%d %H:%M:%S ET')}"
             )
+
+            send_telegram(message)
+
+            print("Telegram price sent.", flush=True)
+
+            last_sent = current_time
+
+    except Exception as e:
+
+        print(
+            f"{datetime.now(NY).strftime('%Y-%m-%d %H:%M:%S ET')} "
+            f"ERROR: {type(e).__name__}: {e}",
+            flush=True
+        )
 
     time.sleep(UPDATE_SECONDS)
