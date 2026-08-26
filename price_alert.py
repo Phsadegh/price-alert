@@ -4,10 +4,6 @@ import requests
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-# =========================
-# CONFIG
-# =========================
-
 SYMBOL = "USTEC"
 BASE_URL = "https://biquote.io/api"
 
@@ -20,11 +16,9 @@ BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 
 
-# =========================
-# TELEGRAM
-# =========================
-
 def send_telegram(message):
+    print("Sending Telegram message...", flush=True)
+
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
 
     response = requests.post(
@@ -36,12 +30,10 @@ def send_telegram(message):
         timeout=20,
     )
 
+    print(f"Telegram HTTP status: {response.status_code}", flush=True)
+
     response.raise_for_status()
 
-
-# =========================
-# BIQUOTE
-# =========================
 
 def get_price():
 
@@ -51,86 +43,95 @@ def get_price():
         "symbol": SYMBOL
     }
 
-    response = requests.get(
-        url,
-        params=params,
-        timeout=20
-    )
+    print(f"Requesting Biquote: {url}", flush=True)
+    print(f"Parameters: {params}", flush=True)
 
-    response.raise_for_status()
+    try:
 
-    data = response.json()
+        response = requests.get(
+            url,
+            params=params,
+            timeout=10
+        )
 
-    print("Biquote response:", data)
+        print(
+            f"Biquote HTTP status: {response.status_code}",
+            flush=True
+        )
 
-    # Try common price fields
-    if isinstance(data, dict):
+        print(
+            f"Biquote URL: {response.url}",
+            flush=True
+        )
 
-        for key in ["price", "last", "last_price", "close", "bid", "ask"]:
+        print(
+            f"Biquote raw response: {response.text[:2000]}",
+            flush=True
+        )
 
-            if key in data:
-                return float(data[key])
+        response.raise_for_status()
 
-        # Sometimes data is nested
-        for value in data.values():
+        data = response.json()
 
-            if isinstance(value, dict):
+        print(
+            f"Biquote JSON: {data}",
+            flush=True
+        )
 
-                for key in ["price", "last", "last_price", "close", "bid", "ask"]:
+        return data
 
-                    if key in value:
-                        return float(value[key])
+    except Exception as e:
 
-    raise ValueError(f"Could not find price in API response: {data}")
+        print(
+            f"BIQUOTE ERROR: {type(e).__name__}: {e}",
+            flush=True
+        )
+
+        return None
 
 
-# =========================
-# MAIN
-# =========================
-
-print("Starting USTEC price monitor...")
+print("====================================", flush=True)
+print("USTEC PRICE MONITOR STARTING", flush=True)
+print("====================================", flush=True)
 
 send_telegram(
     "🟢 USTEC monitor STARTED\n"
-    "Checking Biquote every 30 seconds.\n"
-    "Telegram update every 1 minute."
+    "Testing Biquote connection."
 )
 
 last_sent = 0
 
 while True:
 
-    try:
+    print(
+        f"\nChecking price at "
+        f"{datetime.now(NY).strftime('%Y-%m-%d %H:%M:%S ET')}",
+        flush=True
+    )
 
-        price = get_price()
+    data = get_price()
+
+    if data is not None:
 
         now = datetime.now(NY)
 
-        print(
-            f"{now.strftime('%Y-%m-%d %H:%M:%S ET')} "
-            f"USTEC = {price}"
+        # For now, send the COMPLETE API response
+        # so we can see Biquote's actual structure.
+
+        message = (
+            f"📊 USTEC API TEST\n\n"
+            f"Time: {now.strftime('%Y-%m-%d %H:%M:%S ET')}\n\n"
+            f"{str(data)[:3000]}"
         )
 
-        # Send Telegram once per minute
-        current_time = time.time()
-
-        if current_time - last_sent >= SEND_INTERVAL:
-
-            message = (
-                f"📊 USTEC\n\n"
-                f"Price: {price}\n"
-                f"Time: {now.strftime('%Y-%m-%d %H:%M:%S ET')}"
-            )
-
+        try:
             send_telegram(message)
+            last_sent = time.time()
 
-            last_sent = current_time
-
-    except Exception as e:
-
-        print(
-            f"{datetime.now(NY).strftime('%Y-%m-%d %H:%M:%S ET')} "
-            f"ERROR: {e}"
-        )
+        except Exception as e:
+            print(
+                f"Telegram ERROR: {e}",
+                flush=True
+            )
 
     time.sleep(UPDATE_SECONDS)
