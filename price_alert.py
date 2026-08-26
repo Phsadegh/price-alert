@@ -1,10 +1,10 @@
 import os
+import sys
 import time
 import signal
 import requests
-from datetime import datetime, time as dtime, timezone
-from zoneinfo import ZoneInfo
 from datetime import datetime, time as dtime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 # ============================================================================
 # CONFIG
@@ -18,29 +18,36 @@ COMPLETION_MARGIN = 2     # sec of clock slack before a candle counts as closed
 
 # ---- SRFVG settings (same defaults as the Pine inputs) ----
 SWING_LOOKBACK     = 30
-MONITOR_START_HOUR = 1    # eligible from 01:00 ET
+MONITOR_START_HOUR = 1    # FVGs eligible from 01:00 New York time
+
+# ---- run behaviour ----
+RUN_WINDOW_MINUTES    = 345   # stop cleanly after 5h45m (GitHub caps jobs at 6h)
+SEND_START_NOTICE     = True  # "monitor started" message at launch
+SEND_RUN_REMINDER     = True  # "don't forget" message after the SRFVG alert
+SEND_NO_SIGNAL_NOTICE = True  # message if the window ends without an SRFVG
+
 CHART_FILE = "chart.png"
 
 BAR_MS = 15 * 60 * 1000
-NY  = ZoneInfo("America/New_York")
-UTC = timezone.utc
+NY    = ZoneInfo("America/New_York")
+IRAN  = ZoneInfo("Asia/Tehran")          # UTC+3:30 all year (no DST since 2022)
+UTC   = timezone.utc
 
 BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
-
-IRAN = ZoneInfo("Asia/Tehran")   # Iran = UTC+3:30 all year (no DST since 2022)
-SEND_RUN_REMINDER = True         # send the "run workflow tomorrow" reminder
 
 # ============================================================================
 # STATE
 # ============================================================================
 
-bars = []              # TODAY's completed 15m candles from biquote /ohlc
-forming = None         # candle currently forming (last, incomplete bar)
-valid_from = 0         # first index of `bars` with no gap before it
-marked_day = None      # ET midnight (ms) of the day whose first SRFVG fired
+bars = []                # today's completed 15m candles (biquote /ohlc)
+forming = None           # candle currently forming
+valid_from = 0           # first index of `bars` with no gap before it
+marked_day = None        # ET midnight of the day whose first SRFVG fired
 last_srfvg = None
 last_processed_t = None
+pending_sig = None       # alert that failed to deliver -> retried every poll
+pending_already = False
 shutting_down = False
 
 # ============================================================================
@@ -65,7 +72,7 @@ def send_telegram_photo(image_path, caption):
     r.raise_for_status()
 
 # ============================================================================
-# BIQUOTE — today's 15m candles (same endpoint & params as your Dash code)
+# BIQUOTE (only data source)
 # ============================================================================
 
 def get_price():
@@ -74,16 +81,15 @@ def get_price():
     return float(r.json()["mid"])
 
 def parse_open_time(v):
-    """biquote openTime -> epoch ms (accepts epoch s/ms/µs or ISO string, UTC)."""
     try:
         if isinstance(v, (int, float)):
             ms = float(v)
             if ms > 1e14:
-                ms /= 1000                       # microseconds
+                ms /= 1000
             if ms > 1e11:
-                return int(ms)                   # epoch milliseconds
+                return int(ms)
             if ms > 1e8:
-                return int(ms * 1000)            # epoch seconds
+                return int(ms * 1000)
             return None
         if isinstance(v, str):
             s = v.strip().replace("Z", "+00:00").replace(" ", "T")
@@ -132,9 +138,9 @@ def fetch_today_ohlc():
             continue
         bar = {"t": t, "o": o, "h": h, "l": l, "c": c}
         if t + BAR_MS <= now_ms - COMPLETION_MARGIN * 1000:
-            completed.append(bar)                        # candle is CLOSED
+            completed.append(bar)
         elif forming_bar is None or t > forming_bar["t"]:
-            forming_bar = bar                            # candle still forming
+            forming_bar = bar
     completed.sort(key=lambda x: x["t"])
     return completed, forming_bar
 
@@ -147,10 +153,6 @@ def est_dt(ms):
 
 def est_hm(ms):
     return est_dt(ms).strftime("%H:%M")
-
-# ============================================================================
-# GAP GUARD (patterns/swings may never span a missing candle)
-# ============================================================================
 
 def recompute_valid_from():
     global valid_from
@@ -168,14 +170,14 @@ def find_bullish_swing(i, fvg_bottom, fvg_top, day_start):
         j = i - x
         if j < 1 or j < valid_from:
             break
-        if bars[j]["t"] < day_start:                 # swing after ET midnight
+        if bars[j]["t"] < day_start:
             break
         swing_high = (bars[j]["h"] > bars[j + 1]["h"] and
                       bars[j]["h"] > bars[j - 1]["h"])
         inside = fvg_bottom <= bars[j]["h"] <= fvg_top
         if swing_high and inside:
             ok = True
-            for k in range(j + 1, i - 2):            # Pine: k = j+1 .. i-3
+            for k in range(j + 1, i - 2):
                 if bars[k]["h"] > bars[j]["h"]:
                     ok = False
                     break
@@ -212,21 +214,19 @@ def detect_at(i):
         return None
     c1, c2, c3 = bars[i - 2], bars[i - 1], bars[i]
 
-    close_time = c3["t"] + BAR_MS                    # presentation = c3 close
+    close_time = c3["t"] + BAR_MS
     day_start = midnight_est_ms(close_time)
     if close_time < day_start + MONITOR_START_HOUR * 3_600_000:
-        return None                                  # before 01:00 ET
+        return None
     if day_start == marked_day:
-        return None                                  # day already fired
+        return None
 
-    # bullish
     b_vi12 = c1["o"] < c1["c"] and c2["o"] > c1["c"] and c2["c"] > c1["c"]
     b_vi23 = c2["o"] < c2["c"] and c3["o"] > c2["c"] and c3["c"] > c2["c"]
     b_bot = c1["c"] if b_vi12 else c1["h"]
     b_top = min(c3["o"], c3["c"]) if b_vi23 else c3["l"]
     bull = b_top > b_bot
 
-    # bearish
     s_vi12 = c1["o"] > c1["c"] and c2["o"] < c1["c"] and c2["c"] < c1["c"]
     s_vi23 = c2["o"] > c2["c"] and c3["o"] < c2["c"] and c3["c"] < c2["c"]
     s_top = c1["c"] if s_vi12 else c1["l"]
@@ -252,7 +252,7 @@ def detect_at(i):
     return None
 
 # ============================================================================
-# CHART (today's biquote candles, SRFVG marked) — matplotlib, alert-time only
+# CHART
 # ============================================================================
 
 def render_chart(sig):
@@ -265,10 +265,10 @@ def render_chart(sig):
         print(f"Chart skipped: {e}", flush=True)
         return None
 
-    day = list(bars)                                 # today's completed candles
+    day = list(bars)
     forming_idx = None
     if forming and (not day or forming["t"] > day[-1]["t"]):
-        day.append(dict(forming))                    # candle forming now (dim)
+        day.append(dict(forming))
         forming_idx = len(day) - 1
     if not day:
         return None
@@ -349,51 +349,68 @@ def deliver_srfvg(sig, already=False):
     except Exception as e:
         print(f"Alert delivery FAILED: {e}", flush=True)
     return False
-def send_run_reminder():
-    """After the day's SRFVG alert: remind to run the workflow tomorrow at
-    01:00 New York time (= 08:30 Iran in summer, 09:30 in winter — computed)."""
-    global reminder_day
-    if not SEND_RUN_REMINDER:
-        return
-    today = midnight_est_ms(int(time.time() * 1000))
-    if reminder_day == today:                     # max one reminder per ET day
-        return
-    reminder_day = today
-
-    # tomorrow at MONITOR_START_HOUR (01:00) New York wall-clock time
-    run_at_ny = (datetime.now(NY) + timedelta(days=1)).replace(
-        hour=MONITOR_START_HOUR, minute=0, second=0, microsecond=0)
-    run_at_iran = run_at_ny.astimezone(IRAN)
-    tz_label = "EST" if run_at_ny.utcoffset() == timedelta(hours=-5) else "EDT"
-
-    send_telegram(
-        f"⏰ Reminder: don't forget to run the workflow tomorrow at "
-        f"{run_at_iran:%H:%M} Iran time "
-        f"({run_at_ny:%H:%M} {tz_label} New York)."
-    )
-
-def on_srfvg(sig, already=False):
-    global marked_day, last_srfvg
-    marked_day = sig["day_start"]
-    last_srfvg = sig
-    ok = deliver_srfvg(sig, already)
-    print(f"SRFVG ({sig['direction']}) "
-          f"{est_hm(sig['fvg_from'])}-{est_hm(sig['fvg_to'])} ET "
-          f"{'sent' if ok else 'FAILED'}.", flush=True)
-    if ok:
-        try:
-            send_run_reminder()
-        except Exception as e:
-            print(f"Reminder failed (non-fatal): {e}", flush=True)
 
 # ============================================================================
-# STARTUP SCAN (first successful poll) + LIVE LOOP
+# REMINDER + SHUTDOWN
+# ============================================================================
+
+def next_run_ny():
+    """Next weekday 01:00 New York time (skips Saturday/Sunday)."""
+    d = (datetime.now(NY) + timedelta(days=1)).replace(
+        hour=MONITOR_START_HOUR, minute=0, second=0, microsecond=0)
+    while d.weekday() >= 5:
+        d += timedelta(days=1)
+    return d
+
+def send_run_reminder():
+    run_ny = next_run_ny()
+    run_iran = run_ny.astimezone(IRAN)
+    tz = "EST" if run_ny.utcoffset() == timedelta(hours=-5) else "EDT"
+    text = (
+        f"⏰ Don't forget: the workflow starts {run_ny:%A} at "
+        f"{run_iran:%H:%M} Iran time ({run_ny:%H:%M} {tz}).\n"
+        f"If it hasn't started by itself, run it manually: "
+        f"Actions → Price Alert → Run workflow."
+    )
+    for attempt in range(3):
+        try:
+            send_telegram(text)
+            print("Reminder sent.", flush=True)
+            return
+        except Exception as e:
+            print(f"Reminder attempt {attempt + 1} failed: {e}", flush=True)
+            time.sleep(5)
+
+def stop_workflow(reason):
+    print(reason, flush=True)
+    print("Workflow stopping (clean exit).", flush=True)
+    sys.exit(0)
+
+def after_alert():
+    """Alert delivered -> reminder -> stop the workflow."""
+    if SEND_RUN_REMINDER:
+        send_run_reminder()
+    stop_workflow("SRFVG alerted — done for today.")
+
+def on_srfvg(sig, already=False):
+    global marked_day, last_srfvg, pending_sig, pending_already
+    marked_day = sig["day_start"]
+    last_srfvg = sig
+    print(f"SRFVG ({sig['direction']}) {est_hm(sig['fvg_from'])}-"
+          f"{est_hm(sig['fvg_to'])} ET detected.", flush=True)
+    if deliver_srfvg(sig, already):
+        after_alert()                       # reminder + exit
+    else:
+        pending_sig, pending_already = sig, already
+        print("Delivery failed — will retry every poll.", flush=True)
+
+# ============================================================================
+# STARTUP SCAN + LIVE POLL
 # ============================================================================
 
 def first_scan():
-    """Runs once, when today's candles first arrive: report the day's state."""
     sig = None
-    for i in range(2, len(bars)):                    # chronological scan
+    for i in range(2, len(bars)):
         s = detect_at(i)
         if s:
             sig = s
@@ -401,8 +418,10 @@ def first_scan():
     if sig:
         print(f"Startup scan: SRFVG already formed today "
               f"({est_hm(sig['fvg_from'])}-{est_hm(sig['fvg_to'])} ET).", flush=True)
-        on_srfvg(sig, already=True)                  # alert + chart + times
+        on_srfvg(sig, already=True)         # alert + chart + reminder + exit
     else:
+        if not SEND_START_NOTICE:
+            return
         price_txt = ""
         try:
             price_txt = f"\nCurrent price: {get_price():.2f}"
@@ -410,10 +429,11 @@ def first_scan():
             pass
         send_telegram(
             f"🟢 {SYMBOL} SRFVG monitor STARTED (biquote /ohlc feed)\n"
-            f"15m candles are biquote's own, locked to the EST clock.\n"
+            f"15m candles locked to the New York clock.\n"
             f"Today so far: {len(bars)} completed candles.{price_txt}\n"
             f"Watching for the 1st 15m SRFVG of the day "
-            f"(eligible from {MONITOR_START_HOUR:02d}:00 ET)."
+            f"(eligible from {MONITOR_START_HOUR:02d}:00 ET).\n"
+            f"Stops automatically after the alert."
         )
 
 def poll_once():
@@ -422,7 +442,7 @@ def poll_once():
     completed, forming_bar = fetch_today_ohlc()
     forming = forming_bar
 
-    if last_processed_t is None:                     # very first successful poll
+    if last_processed_t is None:
         if completed:
             bars = completed
             recompute_valid_from()
@@ -434,11 +454,11 @@ def poll_once():
     if not new:
         return
 
-    bars = completed                                 # refresh today's full list
+    bars = completed
     recompute_valid_from()
     idx_by_t = {b["t"]: k for k, b in enumerate(bars)}
 
-    for b in new:                                    # chronological order
+    for b in new:
         print(f"15m closed {est_hm(b['t'])}-{est_hm(b['t'] + BAR_MS)} ET  "
               f"O={b['o']:.2f} H={b['h']:.2f} L={b['l']:.2f} C={b['c']:.2f}",
               flush=True)
@@ -446,7 +466,7 @@ def poll_once():
         if i is not None and i >= 2:
             sig = detect_at(i)
             if sig:
-                on_srfvg(sig, already=False)         # live alert + chart
+                on_srfvg(sig, already=False)   # alert + reminder + exit
         last_processed_t = b["t"]
 
 # ============================================================================
@@ -458,11 +478,40 @@ def _handle_signal(signum, frame):
     shutting_down = True
 
 def main():
+    # ---- LAUNCH GATE (scheduled runs only; manual runs always pass) ----
+    if os.environ.get("GITHUB_EVENT_NAME") == "schedule":
+        now_ny = datetime.now(NY)
+        if now_ny.weekday() >= 5:
+            stop_workflow(f"Scheduled start skipped: weekend in New York ({now_ny:%A}).")
+        if now_ny.hour != MONITOR_START_HOUR:
+            stop_workflow(
+                f"Scheduled start skipped: {now_ny:%H:%M} New York is outside the "
+                f"{MONITOR_START_HOUR:02d}:00 launch window (DST twin cron). "
+                f"Manual runs are never blocked."
+            )
+
     print("====================================", flush=True)
     print(f"{SYMBOL} SRFVG MONITOR — biquote /ohlc, EST 15m candles", flush=True)
+    print(f"Launch: {datetime.now(NY):%Y-%m-%d %H:%M:%S} ET "
+          f"({datetime.now(IRAN):%H:%M} Iran)", flush=True)
     print("====================================", flush=True)
 
+    started_at = time.time()
     while not shutting_down:
+        # stop cleanly before GitHub's 6h job cap
+        if time.time() - started_at >= RUN_WINDOW_MINUTES * 60:
+            if SEND_NO_SIGNAL_NOTICE:
+                try:
+                    send_telegram(f"⚪ {SYMBOL}: monitoring window ended "
+                                  f"(no SRFVG alerted). Workflow stopping.")
+                except Exception as e:
+                    print(f"No-signal notice failed: {e}", flush=True)
+            stop_workflow("Monitoring window finished (5h45m).")
+
+        # retry a failed alert delivery
+        if pending_sig is not None and deliver_srfvg(pending_sig, pending_already):
+            after_alert()
+
         try:
             poll_once()
             last_close = est_hm(bars[-1]["t"] + BAR_MS) if bars else "-"
