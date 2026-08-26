@@ -4,12 +4,25 @@ import requests
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
+# =========================
+# CONFIG
+# =========================
+
+SYMBOL = "USTEC"
+BASE_URL = "https://biquote.io/api"
+
+UPDATE_SECONDS = 30
+SEND_INTERVAL = 60
+
+NY = ZoneInfo("America/New_York")
+
 BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 
-CHECK_INTERVAL = 15 * 60       # 15 minutes
-RUN_TIME = 6 * 60 * 60         # 6 hours
 
+# =========================
+# TELEGRAM
+# =========================
 
 def send_telegram(message):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
@@ -26,36 +39,98 @@ def send_telegram(message):
     response.raise_for_status()
 
 
+# =========================
+# BIQUOTE
+# =========================
+
 def get_price():
-    # Temporary test price
-    # We will replace this with the real market API next.
-    return 100.00
 
+    url = f"{BASE_URL}/quote"
 
-start_time = time.time()
+    params = {
+        "symbol": SYMBOL
+    }
 
-send_telegram("🟢 Price monitor STARTED")
-
-while time.time() - start_time < RUN_TIME:
-
-    now = datetime.now(ZoneInfo("America/New_York"))
-    price = get_price()
-
-    message = (
-        f"📊 Price Check\n\n"
-        f"Price: {price}\n"
-        f"Time: {now.strftime('%Y-%m-%d %H:%M:%S ET')}"
+    response = requests.get(
+        url,
+        params=params,
+        timeout=20
     )
 
+    response.raise_for_status()
+
+    data = response.json()
+
+    print("Biquote response:", data)
+
+    # Try common price fields
+    if isinstance(data, dict):
+
+        for key in ["price", "last", "last_price", "close", "bid", "ask"]:
+
+            if key in data:
+                return float(data[key])
+
+        # Sometimes data is nested
+        for value in data.values():
+
+            if isinstance(value, dict):
+
+                for key in ["price", "last", "last_price", "close", "bid", "ask"]:
+
+                    if key in value:
+                        return float(value[key])
+
+    raise ValueError(f"Could not find price in API response: {data}")
+
+
+# =========================
+# MAIN
+# =========================
+
+print("Starting USTEC price monitor...")
+
+send_telegram(
+    "🟢 USTEC monitor STARTED\n"
+    "Checking Biquote every 30 seconds.\n"
+    "Telegram update every 1 minute."
+)
+
+last_sent = 0
+
+while True:
+
     try:
-        send_telegram(message)
-        print(message)
+
+        price = get_price()
+
+        now = datetime.now(NY)
+
+        print(
+            f"{now.strftime('%Y-%m-%d %H:%M:%S ET')} "
+            f"USTEC = {price}"
+        )
+
+        # Send Telegram once per minute
+        current_time = time.time()
+
+        if current_time - last_sent >= SEND_INTERVAL:
+
+            message = (
+                f"📊 USTEC\n\n"
+                f"Price: {price}\n"
+                f"Time: {now.strftime('%Y-%m-%d %H:%M:%S ET')}"
+            )
+
+            send_telegram(message)
+
+            last_sent = current_time
 
     except Exception as e:
-        print(f"Telegram error: {e}")
 
-    # Wait 15 minutes
-    time.sleep(CHECK_INTERVAL)
+        print(
+            f"{datetime.now(NY).strftime('%Y-%m-%d %H:%M:%S ET')} "
+            f"ERROR: {e}"
+        )
 
-send_telegram("🔴 Price monitor STOPPED")
-print("Finished.")
+    time.sleep(UPDATE_SECONDS)
