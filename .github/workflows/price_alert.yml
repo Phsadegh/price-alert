@@ -3,8 +3,13 @@ name: Price Alert
 on:
   workflow_dispatch:
   schedule:
-    - cron: "3 5 * * 1-5"    # 01:03 New York, EDT season (Mar–Nov)
-    - cron: "3 6 * * 1-5"    # 01:03 New York, EST season (Nov–Mar)
+    # 01:00 New York, Mon-Fri, DST-proof (GitHub cron is UTC-only):
+    #   EDT (Mar-Nov): 05:00 UTC = 01:00 NY -> monitor starts
+    #                  06:00 UTC = 02:00 NY -> launch gate exits in ~1 min
+    #   EST (Nov-Mar): 05:00 UTC = 00:00 NY -> launch gate exits in ~1 min
+    #                  06:00 UTC = 01:00 NY -> monitor starts
+    - cron: "0 5 * * 1-5"
+    - cron: "0 6 * * 1-5"
 
 concurrency:
   group: price-monitor        # never two monitors at once (no duplicate alerts)
