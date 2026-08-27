@@ -121,7 +121,10 @@ def fetch_today_ohlc():
         timeout=10,
     )
     r.raise_for_status()
-    raw = (r.json() or {}).get("bars") or []
+    data = r.json() or {}
+    raw = data.get("bars") or []
+    if not raw:
+        print(f"DEBUG /ohlc at {now_ny:%H:%M:%S} ET -> {str(data)[:400]}", flush=True)
 
     now_ms = int(time.time() * 1000)
     midnight_ms = midnight_est_ms(now_ms)
@@ -495,6 +498,22 @@ def main():
     print(f"Launch: {datetime.now(NY):%Y-%m-%d %H:%M:%S} ET "
           f"({datetime.now(IRAN):%H:%M} Iran)", flush=True)
     print("====================================", flush=True)
+
+    print("====================================", flush=True)
+    print(f"{SYMBOL} SRFVG MONITOR — biquote /ohlc, EST 15m candles", flush=True)
+    print(f"Launch: {datetime.now(NY):%Y-%m-%d %H:%M:%S} ET "
+          f"({datetime.now(IRAN):%H:%M} Iran)", flush=True)
+    print("====================================", flush=True)
+
+    # NEW: Telegram start message
+    try:
+        send_telegram(
+            f"🟢 {SYMBOL} SRFVG monitor started\n"
+            f"{datetime.now(NY):%Y-%m-%d %H:%M:%S} ET "
+            f"({datetime.now(IRAN):%H:%M} Iran)"
+        )
+    except Exception as e:
+        print(f"Start message failed: {e}", flush=True)
 
     started_at = time.time()
     while not shutting_down:
