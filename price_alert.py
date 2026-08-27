@@ -45,10 +45,12 @@ forming = None           # candle currently forming
 valid_from = 0           # first index of `bars` with no gap before it
 marked_day = None        # ET midnight of the day whose first SRFVG fired
 last_srfvg = None
-last_processed_t = None
+last_processed_t = None  # open time of the last candle already processed
 pending_sig = None       # alert that failed to deliver -> retried every poll
 pending_already = False
 shutting_down = False
+feed_notified = False    # sent the "no candles" warning already
+poll_streak = 0          # consecutive polls with no candles / errors
 
 # ============================================================================
 # TELEGRAM
@@ -81,15 +83,16 @@ def get_price():
     return float(r.json()["mid"])
 
 def parse_open_time(v):
+    """biquote openTime -> epoch ms (accepts epoch s/ms/µs or ISO string, UTC)."""
     try:
         if isinstance(v, (int, float)):
             ms = float(v)
             if ms > 1e14:
-                ms /= 1000
+                ms /= 1000                       # microseconds
             if ms > 1e11:
-                return int(ms)
+                return int(ms)                   # epoch milliseconds
             if ms > 1e8:
-                return int(ms * 1000)
+                return int(ms * 1000)            # epoch seconds
             return None
         if isinstance(v, str):
             s = v.strip().replace("Z", "+00:00").replace(" ", "T")
@@ -123,6 +126,10 @@ def fetch_today_ohlc():
     r.raise_for_status()
     raw = (r.json() or {}).get("bars") or []
 
+    if not raw:
+        print("biquote /ohlc: response contained no bars for today's window.",
+              flush=True)
+
     now_ms = int(time.time() * 1000)
     midnight_ms = midnight_est_ms(now_ms)
     completed, forming_bar = [], None
@@ -138,9 +145,9 @@ def fetch_today_ohlc():
             continue
         bar = {"t": t, "o": o, "h": h, "l": l, "c": c}
         if t + BAR_MS <= now_ms - COMPLETION_MARGIN * 1000:
-            completed.append(bar)
+            completed.append(bar)                        # candle is CLOSED
         elif forming_bar is None or t > forming_bar["t"]:
-            forming_bar = bar
+            forming_bar = bar                            # candle still forming
     completed.sort(key=lambda x: x["t"])
     return completed, forming_bar
 
@@ -159,7 +166,7 @@ def recompute_valid_from():
     valid_from = 0
     for i in range(1, len(bars)):
         if bars[i]["t"] != bars[i - 1]["t"] + BAR_MS:
-            valid_from = i
+            valid_from = i              # gap -> older history unusable
 
 # ============================================================================
 # SWING SEARCH (port of the Pine functions)
@@ -170,14 +177,14 @@ def find_bullish_swing(i, fvg_bottom, fvg_top, day_start):
         j = i - x
         if j < 1 or j < valid_from:
             break
-        if bars[j]["t"] < day_start:
+        if bars[j]["t"] < day_start:                 # swing after ET midnight
             break
         swing_high = (bars[j]["h"] > bars[j + 1]["h"] and
                       bars[j]["h"] > bars[j - 1]["h"])
         inside = fvg_bottom <= bars[j]["h"] <= fvg_top
         if swing_high and inside:
             ok = True
-            for k in range(j + 1, i - 2):
+            for k in range(j + 1, i - 2):            # Pine: k = j+1 .. i-3
                 if bars[k]["h"] > bars[j]["h"]:
                     ok = False
                     break
@@ -210,23 +217,26 @@ def find_bearish_swing(i, fvg_bottom, fvg_top, day_start):
 # ============================================================================
 
 def detect_at(i):
+    """SRFVG check with candle 3 = bars[i]. Returns signal dict or None."""
     if i < 2 or i - 2 < valid_from:
         return None
     c1, c2, c3 = bars[i - 2], bars[i - 1], bars[i]
 
-    close_time = c3["t"] + BAR_MS
+    close_time = c3["t"] + BAR_MS                    # presentation = c3 close
     day_start = midnight_est_ms(close_time)
     if close_time < day_start + MONITOR_START_HOUR * 3_600_000:
-        return None
+        return None                                  # before 01:00 ET
     if day_start == marked_day:
-        return None
+        return None                                  # day already fired
 
+    # ---- bullish ----
     b_vi12 = c1["o"] < c1["c"] and c2["o"] > c1["c"] and c2["c"] > c1["c"]
     b_vi23 = c2["o"] < c2["c"] and c3["o"] > c2["c"] and c3["c"] > c2["c"]
     b_bot = c1["c"] if b_vi12 else c1["h"]
     b_top = min(c3["o"], c3["c"]) if b_vi23 else c3["l"]
     bull = b_top > b_bot
 
+    # ---- bearish ----
     s_vi12 = c1["o"] > c1["c"] and c2["o"] < c1["c"] and c2["c"] < c1["c"]
     s_vi23 = c2["o"] > c2["c"] and c3["o"] < c2["c"] and c3["c"] < c2["c"]
     s_top = c1["c"] if s_vi12 else c1["l"]
@@ -252,7 +262,7 @@ def detect_at(i):
     return None
 
 # ============================================================================
-# CHART
+# CHART (today's biquote candles, SRFVG marked) — matplotlib, alert-time only
 # ============================================================================
 
 def render_chart(sig):
@@ -265,10 +275,10 @@ def render_chart(sig):
         print(f"Chart skipped: {e}", flush=True)
         return None
 
-    day = list(bars)
+    day = list(bars)                                 # today's completed candles
     forming_idx = None
     if forming and (not day or forming["t"] > day[-1]["t"]):
-        day.append(dict(forming))
+        day.append(dict(forming))                    # candle forming now (dim)
         forming_idx = len(day) - 1
     if not day:
         return None
@@ -278,10 +288,12 @@ def render_chart(sig):
     for idx, b in enumerate(day):
         col = up if b["c"] >= b["o"] else dn
         alpha = 0.5 if idx == forming_idx else 1.0
-        ax.plot([idx, idx], [b["l"], b["h"]], color=col, lw=1, alpha=alpha, zorder=2)
+        ax.plot([idx, idx], [b["l"], b["h"]], color=col, lw=1, alpha=alpha,
+                zorder=2)
         lo, hi = min(b["o"], b["c"]), max(b["o"], b["c"])
         ax.add_patch(Rectangle((idx - 0.35, lo), 0.7, max(hi - lo, 1e-9),
-                               facecolor=col, edgecolor=col, alpha=alpha, zorder=3))
+                               facecolor=col, edgecolor=col, alpha=alpha,
+                               zorder=3))
 
     t1, t3 = sig["fvg_from"], sig["fvg_to"] - BAR_MS
     i1 = next((k for k, b in enumerate(day) if b["t"] == t1), None)
@@ -294,7 +306,8 @@ def render_chart(sig):
                                facecolor=col, edgecolor=col,
                                alpha=0.22, lw=1.5, zorder=4))
         ax.text(i3 + 0.7, (sig["top"] + sig["bottom"]) / 2, "SRFVG",
-                color=col, fontsize=11, fontweight="bold", va="center", zorder=5)
+                color=col, fontsize=11, fontweight="bold", va="center",
+                zorder=5)
     k = next((k for k, b in enumerate(day) if b["t"] == sig["swing_t"]), None)
     if k is not None:
         ax.scatter([k], [sig["swing_level"]],
@@ -342,7 +355,8 @@ def deliver_srfvg(sig, already=False):
                 send_telegram(caption)
             return True
         except Exception as e:
-            print(f"Alert delivery failed (attempt {attempt + 1}): {e}", flush=True)
+            print(f"Alert delivery failed (attempt {attempt + 1}): {e}",
+                  flush=True)
             time.sleep(5)
     try:
         send_telegram(caption)
@@ -409,32 +423,21 @@ def on_srfvg(sig, already=False):
 # ============================================================================
 
 def first_scan():
+    """Runs once, when today's candles first arrive: report the day's state."""
     sig = None
-    for i in range(2, len(bars)):
+    for i in range(2, len(bars)):                    # chronological scan
         s = detect_at(i)
         if s:
             sig = s
             break
     if sig:
         print(f"Startup scan: SRFVG already formed today "
-              f"({est_hm(sig['fvg_from'])}-{est_hm(sig['fvg_to'])} ET).", flush=True)
+              f"({est_hm(sig['fvg_from'])}-{est_hm(sig['fvg_to'])} ET).",
+              flush=True)
         on_srfvg(sig, already=True)         # alert + chart + reminder + exit
     else:
-        if not SEND_START_NOTICE:
-            return
-        price_txt = ""
-        try:
-            price_txt = f"\nCurrent price: {get_price():.2f}"
-        except Exception:
-            pass
-        send_telegram(
-            f"🟢 {SYMBOL} SRFVG monitor STARTED (biquote /ohlc feed)\n"
-            f"15m candles locked to the New York clock.\n"
-            f"Today so far: {len(bars)} completed candles.{price_txt}\n"
-            f"Watching for the 1st 15m SRFVG of the day "
-            f"(eligible from {MONITOR_START_HOUR:02d}:00 ET).\n"
-            f"Stops automatically after the alert."
-        )
+        print(f"Startup scan complete: {len(bars)} candles, "
+              f"no SRFVG formed yet today.", flush=True)
 
 def poll_once():
     global bars, forming, last_processed_t
@@ -442,7 +445,7 @@ def poll_once():
     completed, forming_bar = fetch_today_ohlc()
     forming = forming_bar
 
-    if last_processed_t is None:
+    if last_processed_t is None:                     # first poll with candles
         if completed:
             bars = completed
             recompute_valid_from()
@@ -454,11 +457,11 @@ def poll_once():
     if not new:
         return
 
-    bars = completed
+    bars = completed                                 # refresh today's full list
     recompute_valid_from()
     idx_by_t = {b["t"]: k for k, b in enumerate(bars)}
 
-    for b in new:
+    for b in new:                                    # chronological order
         print(f"15m closed {est_hm(b['t'])}-{est_hm(b['t'] + BAR_MS)} ET  "
               f"O={b['o']:.2f} H={b['h']:.2f} L={b['l']:.2f} C={b['c']:.2f}",
               flush=True)
@@ -466,7 +469,7 @@ def poll_once():
         if i is not None and i >= 2:
             sig = detect_at(i)
             if sig:
-                on_srfvg(sig, already=False)   # alert + reminder + exit
+                on_srfvg(sig, already=False)         # alert + reminder + exit
         last_processed_t = b["t"]
 
 # ============================================================================
@@ -478,16 +481,19 @@ def _handle_signal(signum, frame):
     shutting_down = True
 
 def main():
+    global poll_streak, feed_notified
+
     # ---- LAUNCH GATE (scheduled runs only; manual runs always pass) ----
     if os.environ.get("GITHUB_EVENT_NAME") == "schedule":
         now_ny = datetime.now(NY)
         if now_ny.weekday() >= 5:
-            stop_workflow(f"Scheduled start skipped: weekend in New York ({now_ny:%A}).")
+            stop_workflow(f"Scheduled start skipped: weekend in New York "
+                          f"({now_ny:%A}).")
         if now_ny.hour != MONITOR_START_HOUR:
             stop_workflow(
-                f"Scheduled start skipped: {now_ny:%H:%M} New York is outside the "
-                f"{MONITOR_START_HOUR:02d}:00 launch window (DST twin cron). "
-                f"Manual runs are never blocked."
+                f"Scheduled start skipped: {now_ny:%H:%M} New York is outside "
+                f"the {MONITOR_START_HOUR:02d}:00 launch window (DST twin "
+                f"cron). Manual runs are never blocked."
             )
 
     print("====================================", flush=True)
@@ -496,8 +502,24 @@ def main():
           f"({datetime.now(IRAN):%H:%M} Iran)", flush=True)
     print("====================================", flush=True)
 
+    # ---- START message: sent IMMEDIATELY, independent of feed status ----
+    if SEND_START_NOTICE:
+        try:
+            send_telegram(
+                f"🟢 {SYMBOL} SRFVG monitor STARTED (biquote /ohlc feed)\n"
+                f"Launch: {datetime.now(NY):%Y-%m-%d %H:%M} ET / "
+                f"{datetime.now(IRAN):%H:%M} Iran\n"
+                f"Waiting for today's 15m candles…\n"
+                f"Watching for the 1st 15m SRFVG of the day "
+                f"(eligible from {MONITOR_START_HOUR:02d}:00 ET).\n"
+                f"Stops automatically after the alert."
+            )
+        except Exception as e:
+            print(f"Start message failed: {e}", flush=True)
+
     started_at = time.time()
     while not shutting_down:
+
         # stop cleanly before GitHub's 6h job cap
         if time.time() - started_at >= RUN_WINDOW_MINUTES * 60:
             if SEND_NO_SIGNAL_NOTICE:
@@ -509,20 +531,45 @@ def main():
             stop_workflow("Monitoring window finished (5h45m).")
 
         # retry a failed alert delivery
-        if pending_sig is not None and deliver_srfvg(pending_sig, pending_already):
+        if pending_sig is not None and deliver_srfvg(pending_sig,
+                                                     pending_already):
             after_alert()
 
+        feed_issue = False
         try:
             poll_once()
-            last_close = est_hm(bars[-1]["t"] + BAR_MS) if bars else "-"
-            form_txt = est_hm(forming["t"]) if forming else "-"
-            print(f"{datetime.now(NY):%H:%M:%S} ET | candles today: {len(bars)} "
-                  f"| last close: {last_close} | forming: {form_txt}", flush=True)
+            if not bars:
+                feed_issue = True              # fetch worked, but no candles
         except Exception as e:
             print(f"{datetime.now(NY):%H:%M:%S} ET ERROR: "
                   f"{type(e).__name__}: {e}", flush=True)
+            feed_issue = True
 
-        for _ in range(POLL_SECONDS):
+        if feed_issue:
+            poll_streak += 1
+            if poll_streak == 10 and not feed_notified:   # ~5 min of nothing
+                feed_notified = True
+                try:
+                    send_telegram(
+                        f"⚠️ {SYMBOL}: no candles received from biquote after "
+                        f"~5 minutes.\n"
+                        f"Market may be closed (weekend/holiday in New York) "
+                        f"or the feed is down.\n"
+                        f"Monitor keeps retrying — details in the Actions log."
+                    )
+                except Exception as e:
+                    print(f"Feed warning failed: {e}", flush=True)
+        else:
+            poll_streak = 0
+            feed_notified = False
+
+        last_close = est_hm(bars[-1]["t"] + BAR_MS) if bars else "-"
+        form_txt = est_hm(forming["t"]) if forming else "-"
+        print(f"{datetime.now(NY):%H:%M:%S} ET | candles today: {len(bars)} "
+              f"| last close: {last_close} | forming: {form_txt} "
+              f"| streak: {poll_streak}", flush=True)
+
+        for _ in range(POLL_SECONDS):          # short sleeps -> fast shutdown
             if shutting_down:
                 break
             time.sleep(1)
